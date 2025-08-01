@@ -17,6 +17,7 @@ use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
+use walkdir::WalkDir;
 
 // Struct to represent directory information
 #[derive(Debug, Clone)]
@@ -64,41 +65,47 @@ impl App {
     fn scan_directories(&mut self) {
         let mut dirs = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(&self.current_directory) {
-            for entry in entries.flatten() {
+        let mut it = WalkDir::new(&self.current_directory).into_iter();
+
+        loop {
+            let entry = match it.next() {
+                Some(Ok(entry)) => entry,
+                Some(Err(_)) => continue, // or handle error
+                None => break,
+            };
+
+            let is_dir = entry.file_type().is_dir();
+            let dir_name = entry.file_name().to_string_lossy();
+
+            if is_dir && self.folders_to_clean.contains(&dir_name.to_string()) {
+                // This is a directory we want to clean. Add it to the list.
                 if let Ok(metadata) = entry.metadata() {
-                    // Only process directories
-                    if metadata.is_dir() {
-                        let modified_time = match metadata.modified() {
-                            Ok(t) => t,
-                            Err(_) => UNIX_EPOCH,
-                        }
+                    let modified_time = match metadata.modified() {
+                        Ok(t) => t,
+                        Err(_) => UNIX_EPOCH,
+                    }
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                    let days_ago = (SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
-                        .as_secs();
+                        .as_secs()
+                        - modified_time)
+                        / (24 * 60 * 60);
 
-                        let days_ago = (SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
-                            - modified_time)
-                            / (24 * 60 * 60);
+                    let dir_size = self.calculate_directory_size(&entry.path().to_path_buf());
 
-                        // Check if this directory name matches one we want to clean
-                        let dir_name = entry.file_name().to_string_lossy().into_owned();
-                        if self.folders_to_clean.contains(&dir_name) {
-                            // Calculate directory size
-                            let dir_size = self.calculate_directory_size(&entry.path());
-
-                            dirs.push(DirInfo {
-                                path: entry.path(),
-                                modified_days_ago: days_ago as u32,
-                                selected: days_ago > 30, // Auto-select directories older than 30 days
-                                size_bytes: dir_size,
-                            });
-                        }
-                    }
+                    dirs.push(DirInfo {
+                        path: entry.path().to_path_buf(),
+                        modified_days_ago: days_ago as u32,
+                        selected: days_ago > 30, // Auto-select directories older than 30 days
+                        size_bytes: dir_size,
+                    });
                 }
+                // And we don't want to descend into it.
+                it.skip_current_dir();
             }
         }
 
