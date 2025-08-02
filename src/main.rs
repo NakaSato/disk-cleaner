@@ -11,13 +11,35 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
+use glob::Pattern;
 use std::{
     fs::{self},
     io::stdout,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
+
+const SPINNER_CHARS: [char; 8] = ['⠁', '⠂', '⠄', '⡀', '⢀', '⠠', '⠐', '⠈'];
+
+// App state enum
+enum AppState {
+    Scanning,
+    ScanComplete,
+}
+
+// Messages from scan thread
+enum ScanUpdate {
+    Path(PathBuf),
+    Result(DirInfo),
+    Done,
+}
 
 // Struct to represent directory information
 #[derive(Debug, Clone)]
@@ -38,8 +60,14 @@ struct ScanResults {
 
 // App state
 struct App {
+    state: AppState,
+    spinner_index: usize,
+    current_scan_path: Option<PathBuf>,
+    scan_receiver: Option<mpsc::Receiver<ScanUpdate>>,
+    scan_stop_signal: Arc<AtomicBool>,
     folders_to_clean: Vec<String>,
     selected_folders: Vec<bool>,
+    ignore_patterns: Vec<String>,
     current_directory: PathBuf,
     dirs_to_clean: Vec<DirInfo>,
     dir_list_state: ListState,
@@ -49,76 +77,101 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let mut app = App {
+        App {
+            state: AppState::Scanning,
+            spinner_index: 0,
+            current_scan_path: None,
+            scan_receiver: None,
+            scan_stop_signal: Arc::new(AtomicBool::new(false)),
             folders_to_clean: vec!["node_modules".to_string(), "target".to_string()],
             selected_folders: vec![true, true],
+            ignore_patterns: vec![".*".to_string()],
             current_directory: PathBuf::from("."),
             dirs_to_clean: Vec::new(),
             dir_list_state: ListState::default(),
             confirm_action: None,
             scan_results: ScanResults::default(),
-        };
-        app.dir_list_state.select(Some(0));
-        app
+        }
     }
 
-    fn scan_directories(&mut self) {
-        let mut dirs = Vec::new();
+    fn start_scan(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.scan_receiver = Some(rx);
+        self.state = AppState::Scanning;
+        self.dirs_to_clean.clear(); // Clear previous results
+        self.scan_stop_signal.store(false, Ordering::SeqCst);
 
-        let mut it = WalkDir::new(&self.current_directory).into_iter();
+        let stop_signal = self.scan_stop_signal.clone();
+        let current_directory = self.current_directory.clone();
+        let folders_to_clean = self.folders_to_clean.clone();
+        let ignore_patterns = self.ignore_patterns.clone();
 
-        loop {
-            let entry = match it.next() {
-                Some(Ok(entry)) => entry,
-                Some(Err(_)) => continue, // or handle error
-                None => break,
-            };
+        thread::spawn(move || {
+            let ignore_patterns: Vec<Pattern> = ignore_patterns
+                .iter()
+                .map(|p| Pattern::new(p).expect("Failed to compile glob pattern"))
+                .collect();
+            let mut it = WalkDir::new(&current_directory).into_iter();
 
-            let is_dir = entry.file_type().is_dir();
-            let dir_name = entry.file_name().to_string_lossy();
+            loop {
+                if stop_signal.load(Ordering::SeqCst) {
+                    break;
+                }
+                let entry = match it.next() {
+                    Some(Ok(entry)) => entry,
+                    Some(Err(_)) => continue, // or handle error
+                    None => break,
+                };
 
-            if is_dir && self.folders_to_clean.contains(&dir_name.to_string()) {
-                // This is a directory we want to clean. Add it to the list.
-                if let Ok(metadata) = entry.metadata() {
-                    let modified_time = match metadata.modified() {
-                        Ok(t) => t,
-                        Err(_) => UNIX_EPOCH,
+                let path = entry.path();
+                if entry.file_type().is_dir() {
+                    let _ = tx.send(ScanUpdate::Path(path.to_path_buf()));
+
+                    // Check against ignore patterns
+                    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+                    let should_ignore = ignore_patterns.iter().any(|p| p.matches(&filename));
+
+                    if should_ignore {
+                        it.skip_current_dir();
+                        continue;
                     }
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+                }
 
-                    let days_ago = (SystemTime::now()
+                let is_dir = entry.file_type().is_dir();
+                let dir_name = entry.file_name().to_string_lossy();
+
+                if is_dir && folders_to_clean.contains(&dir_name.to_string()) {
+                    if let Ok(metadata) = entry.metadata() {
+                        let modified_time = match metadata.modified() {
+                            Ok(t) => t,
+                            Err(_) => UNIX_EPOCH,
+                        }
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
-                        .as_secs()
-                        - modified_time)
-                        / (24 * 60 * 60);
+                        .as_secs();
 
-                    let dir_size = self.calculate_directory_size(&entry.path().to_path_buf());
+                        let days_ago = (SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            - modified_time)
+                            / (24 * 60 * 60);
 
-                    dirs.push(DirInfo {
-                        path: entry.path().to_path_buf(),
-                        modified_days_ago: days_ago as u32,
-                        selected: days_ago > 30, // Auto-select directories older than 30 days
-                        size_bytes: dir_size,
-                    });
+                        let dir_size = calculate_directory_size(&path.to_path_buf());
+
+                        let dir_info = DirInfo {
+                            path: path.to_path_buf(),
+                            modified_days_ago: days_ago as u32,
+                            selected: days_ago > 30, // Auto-select directories older than 30 days
+                            size_bytes: dir_size,
+                        };
+                        let _ = tx.send(ScanUpdate::Result(dir_info));
+                    }
+                    it.skip_current_dir();
                 }
-                // And we don't want to descend into it.
-                it.skip_current_dir();
             }
-        }
-
-        // Sort directories by modification time (oldest first)
-        dirs.sort_by_key(|d| d.modified_days_ago);
-
-        self.dirs_to_clean = dirs.clone();
-
-        // Update scan results
-        self.scan_results.total_folders = dirs.len();
-        self.scan_results.found_folders = dirs.iter().filter(|d| d.selected).count();
-        self.scan_results.total_size_gb =
-            dirs.iter().map(|d| d.size_bytes as f64).sum::<f64>() / (1024.0 * 1024.0 * 1024.0);
+            let _ = tx.send(ScanUpdate::Done);
+        });
     }
 
     fn move_dirs_to_trash(&self) {
@@ -134,118 +187,134 @@ impl App {
         }
     }
 
-    fn calculate_directory_size(&self, path: &PathBuf) -> u64 {
-        let mut total_size = 0u64;
-
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if metadata.is_dir() {
-                        // Recursive call for subdirectories
-                        total_size += self.calculate_directory_size(&entry.path());
-                    } else {
-                        // Add file size
-                        total_size += metadata.len();
-                    }
-                }
-            }
-        }
-
-        total_size
-    }
-
     fn update_selection_scan_results(&mut self) {
         self.scan_results.found_folders = self.dirs_to_clean.iter().filter(|d| d.selected).count();
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) {
-        if let Some(ref _confirm_action) = self.confirm_action {
+        if let Some(ref action) = self.confirm_action.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.move_dirs_to_trash();
-                    self.confirm_action = None; // Reset confirmation after action
-                    self.scan_directories(); // Rescan to get updated directory list
+                    if action.starts_with("Move") {
+                        self.move_dirs_to_trash();
+                        self.start_scan();
+                    } else if action == "Stop the current scan" {
+                        self.scan_stop_signal.store(true, Ordering::SeqCst);
+                    }
+                    self.confirm_action = None;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.confirm_action = None; // Cancel confirmation
+                    self.confirm_action = None;
                 }
                 _ => {}
             }
             return;
         }
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => std::process::exit(0),
-            // Handle list navigation with clamped indices
-            KeyCode::Down => {
-                // Handle list navigation down with proper bounds checking
-                if !self.dirs_to_clean.is_empty() {
-                    let current_selection = self.dir_list_state.selected().unwrap_or(0);
-                    // Make sure we don't go beyond the list length
-                    if current_selection + 1 < self.dirs_to_clean.len() {
-                        self.dir_list_state.select(Some(current_selection + 1));
+        match self.state {
+            AppState::Scanning => match key.code {
+                KeyCode::Char('q') => std::process::exit(0),
+                KeyCode::Esc => {
+                    self.confirm_action = Some("Stop the current scan".to_string());
+                }
+                _ => {}
+            },
+            AppState::ScanComplete => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => std::process::exit(0),
+                // Handle list navigation with clamped indices
+                KeyCode::Down => {
+                    // Handle list navigation down with proper bounds checking
+                    if !self.dirs_to_clean.is_empty() {
+                        let current_selection = self.dir_list_state.selected().unwrap_or(0);
+                        // Make sure we don't go beyond the list length
+                        if current_selection + 1 < self.dirs_to_clean.len() {
+                            self.dir_list_state.select(Some(current_selection + 1));
+                        }
                     }
                 }
-            }
-            // Handle list navigation with clamped indices
-            KeyCode::Up => {
-                // Handle list navigation up with proper bounds checking
-                if !self.dirs_to_clean.is_empty() {
-                    let current_selection = self.dir_list_state.selected().unwrap_or(0);
-                    // Make sure we don't go below 0
-                    if current_selection > 0 {
-                        self.dir_list_state.select(Some(current_selection - 1));
+                // Handle list navigation with clamped indices
+                KeyCode::Up => {
+                    // Handle list navigation up with proper bounds checking
+                    if !self.dirs_to_clean.is_empty() {
+                        let current_selection = self.dir_list_state.selected().unwrap_or(0);
+                        // Make sure we don't go below 0
+                        if current_selection > 0 {
+                            self.dir_list_state.select(Some(current_selection - 1));
+                        }
                     }
                 }
-            }
-            KeyCode::Enter => {
-                if !self.dirs_to_clean.is_empty() {
-                    // Proceed to confirmation when Enter is pressed in list
-                    let selected_count = self.dirs_to_clean.iter().filter(|d| d.selected).count();
-                    if selected_count > 0 {
-                        self.confirm_action =
-                            Some(format!("Move {} selected items to trash", selected_count));
+                KeyCode::Enter => {
+                    if !self.dirs_to_clean.is_empty() {
+                        // Proceed to confirmation when Enter is pressed in list
+                        let selected_count =
+                            self.dirs_to_clean.iter().filter(|d| d.selected).count();
+                        if selected_count > 0 {
+                            self.confirm_action =
+                                Some(format!("Move {} selected items to trash", selected_count));
+                        }
                     }
                 }
-            }
-            KeyCode::Char(' ') => {
-                // Toggle selection of current directory
-                if !self.dirs_to_clean.is_empty() {
-                    let selected = self.dir_list_state.selected().unwrap_or(0);
-                    if selected < self.dirs_to_clean.len() {
-                        self.dirs_to_clean[selected].selected =
-                            !self.dirs_to_clean[selected].selected;
+                KeyCode::Char(' ') => {
+                    // Toggle selection of current directory
+                    if !self.dirs_to_clean.is_empty() {
+                        if let Some(selected) = self.dir_list_state.selected() {
+                            if selected < self.dirs_to_clean.len() {
+                                self.dirs_to_clean[selected].selected =
+                                    !self.dirs_to_clean[selected].selected;
+                            }
+                        }
+                    }
+                    self.update_selection_scan_results();
+                }
+                KeyCode::Char('a') => {
+                    // Select all directories
+                    for dir in &mut self.dirs_to_clean {
+                        dir.selected = true;
+                    }
+                    self.update_selection_scan_results();
+                }
+                KeyCode::Char('d') => {
+                    // Deselect all directories
+                    for dir in &mut self.dirs_to_clean {
+                        dir.selected = false;
+                    }
+                    self.update_selection_scan_results();
+                }
+                KeyCode::Char('c') => {
+                    // Confirm deletion
+                    if !self.dirs_to_clean.is_empty() {
+                        let selected_count =
+                            self.dirs_to_clean.iter().filter(|d| d.selected).count();
+                        if selected_count > 0 {
+                            self.confirm_action =
+                                Some(format!("Move {} selected items to trash", selected_count));
+                        }
                     }
                 }
-                self.update_selection_scan_results();
-            }
-            KeyCode::Char('a') => {
-                // Select all directories
-                for dir in &mut self.dirs_to_clean {
-                    dir.selected = true;
-                }
-                self.update_selection_scan_results();
-            }
-            KeyCode::Char('d') => {
-                // Deselect all directories
-                for dir in &mut self.dirs_to_clean {
-                    dir.selected = false;
-                }
-                self.update_selection_scan_results();
-            }
-            KeyCode::Char('c') => {
-                // Confirm deletion
-                if !self.dirs_to_clean.is_empty() {
-                    let selected_count = self.dirs_to_clean.iter().filter(|d| d.selected).count();
-                    if selected_count > 0 {
-                        self.confirm_action =
-                            Some(format!("Move {} selected items to trash", selected_count));
-                    }
-                }
-            }
-            _ => {}
+                _ => {}
+            },
         }
     }
+}
+
+fn calculate_directory_size(path: &PathBuf) -> u64 {
+    let mut total_size = 0u64;
+
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    // Recursive call for subdirectories
+                    total_size += calculate_directory_size(&entry.path());
+                } else {
+                    // Add file size
+                    total_size += metadata.len();
+                }
+            }
+        }
+    }
+
+    total_size
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -268,21 +337,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Scan for directories with specific names in current directory
-    app.scan_directories();
+    // Start the initial scan
+    app.start_scan();
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                break;
+        // Handle scan updates
+        if let Some(receiver) = &app.scan_receiver {
+            if let Ok(update) = receiver.try_recv() {
+                match update {
+                    ScanUpdate::Path(path) => {
+                        app.current_scan_path = Some(path);
+                    }
+                    ScanUpdate::Result(dir_info) => {
+                        app.dirs_to_clean.push(dir_info);
+                        app.dirs_to_clean.sort_by_key(|d| d.modified_days_ago);
+
+                        app.scan_results.total_folders = app.dirs_to_clean.len();
+                        app.scan_results.found_folders =
+                            app.dirs_to_clean.iter().filter(|d| d.selected).count();
+                        app.scan_results.total_size_gb = app
+                            .dirs_to_clean
+                            .iter()
+                            .map(|d| d.size_bytes as f64)
+                            .sum::<f64>()
+                            / (1024.0 * 1024.0 * 1024.0);
+
+                        if !app.dirs_to_clean.is_empty() && app.dir_list_state.selected().is_none()
+                        {
+                            app.dir_list_state.select(Some(0));
+                        }
+                    }
+                    ScanUpdate::Done => {
+                        app.state = AppState::ScanComplete;
+                        app.scan_receiver = None;
+                        app.current_scan_path = None;
+                    }
+                }
             }
+        }
 
-            // Handle key event
-            app.handle_key_event(key);
+        // Handle input events
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    break;
+                }
+                app.handle_key_event(key);
+            }
+        }
 
-            // A rescan will only happen after a deletion is confirmed.
+        // Update spinner
+        if matches!(app.state, AppState::Scanning) {
+            app.spinner_index = (app.spinner_index + 1) % SPINNER_CHARS.len();
         }
     }
 
@@ -308,11 +416,25 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     // Top bar with directory info and scan results
-    let dir_info = format!("Scanned: {}", app.current_directory.display());
-    let scan_results_text = format!(
-        "Scan completed {} folders, found {} folders",
-        app.scan_results.total_folders, app.scan_results.found_folders
-    );
+    let dir_info = match app.state {
+        AppState::Scanning => format!("Scanning: {}", app.current_directory.display()),
+        AppState::ScanComplete => format!("Scanned: {}", app.current_directory.display()),
+    };
+    let scan_results_text = match app.state {
+        AppState::Scanning => {
+            let spinner = SPINNER_CHARS[app.spinner_index];
+            let path_str = app
+                .current_scan_path
+                .as_ref()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or_default();
+            format!("{} {}", spinner, path_str)
+        }
+        AppState::ScanComplete => format!(
+            "Scan completed {} folders, found {} folders",
+            app.scan_results.total_folders, app.scan_results.found_folders
+        ),
+    };
     let top_paragraph = Paragraph::new(scan_results_text)
         .block(Block::default().title(dir_info).borders(Borders::ALL));
     f.render_widget(top_paragraph, chunks[0]);
@@ -323,7 +445,13 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[1]);
 
-    // Left panel - folders to clean
+    // Left panel area
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(content_chunks[0]);
+
+    // Top-left panel - folders to clean
     let mut folder_items = Vec::new();
     for (i, folder) in app.folders_to_clean.iter().enumerate() {
         let checked = if app.selected_folders[i] {
@@ -342,13 +470,30 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    f.render_widget(folders_list, content_chunks[0]);
+    f.render_widget(folders_list, left_chunks[0]);
+
+    // Bottom-left panel - ignore patterns
+    let ignore_items: Vec<ListItem> = app
+        .ignore_patterns
+        .iter()
+        .map(|p| ListItem::new(p.as_str()))
+        .collect();
+
+    let ignore_list = List::new(ignore_items).block(
+        Block::default()
+            .title("Ignore Patterns")
+            .borders(Borders::ALL),
+    );
+    f.render_widget(ignore_list, left_chunks[1]);
 
     // Right panel - files to clean
     let mut file_items = Vec::new();
 
     if app.dirs_to_clean.is_empty() {
-        file_items.push(ListItem::new("No matching directories found"));
+        if matches!(app.state, AppState::ScanComplete) {
+            file_items.push(ListItem::new("No matching directories found"));
+        }
+        // else: show nothing while scanning
     } else {
         for dir in app.dirs_to_clean.iter() {
             let checked = if dir.selected { "[x]" } else { "[ ]" };
