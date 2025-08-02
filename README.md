@@ -1,81 +1,100 @@
-# Cleaner
+# Disk Cleaner
 
-## Instructions
-
-### **Project Goal**
-
-Create a terminal user interface (TUI) application in Rust named `cleaner-rs` that finds and deletes specified project artifact folders (like `node_modules` or `target`) based on their last modified date.
+A terminal user interface (TUI) application built in Rust that efficiently finds and deletes project artifact folders (like `node_modules` or `target`) to help you reclaim disk space.
 
 ---
 
-### **Core Functionality**
+## Core Functionality
 
-The application should operate in three main states:
+The application provides a single, dynamic interface that updates in real-time. It's designed to be fast, interactive, and intuitive.
 
-1.  **State 1: Configuration Screen (Initial View)**
-    * Display a list with selectable checkboxes for folder names to search for.
-    * **Options**: `node_modules` and `target`.
-    * **Default**: Both options should be **checked** (`[x]`) by default.
-    * **Controls**:
-        * `Up/Down Arrow Keys`: Navigate between options.
-        * `Spacebar`: Toggle the selected option (`[x]` or `[ ]`).
-        * `Enter`: Confirm selection and proceed to the next state.
+### Dynamic UI Layout
 
-2.  **State 2: Scanning & Selection Screen**
-    * **Scanning Logic**:
-        * If the app is run with a path argument (e.g., `cleaner-rs ./projects`), it should scan that directory recursively.
-        * If run with no arguments, it should scan the current working directory recursively.
-        * The scan should only search for folder names selected in State 1.
-    * **Display**:
-        * Show a list of all found folders.
-        * For each folder, display its full path, and its last modified time in a human-readable format (e.g., "3 days ago", "5 months ago").
-        * Sort the list with the **oldest folders appearing first**.
-    * **Selection Logic**:
-        * By default, automatically select all folders that were last modified **more than 30 days ago**.
-    * **Controls**:
-        * `Up/Down Arrow Keys`: Navigate the list of folders.
-        * `Spacebar`: Manually select/unselect a folder.
-        * `Enter`: Proceed to the confirmation state.
-        * `c`: Delete selected folders (move to trash).
-        * `c`: Delete selected folders (move to trash).
+The screen is divided into several panels that provide information and interactivity:
 
-3.  **State 3: Confirmation & Deletion**
-    * **Confirmation Prompt**: After the user hits `Enter` in State 2, display a clear confirmation message.
-        * Example: `Move 5 selected items to trash? (Y/n)`
-    * **Action**:
-        * If the user presses `Y` (or `y`), move each selected folder to the **system's trash/recycle bin**. Do **not** permanently delete.
-        * If the user presses `N` (or `n`), abort the operation and return to the selection screen (State 2).
-        * The application now shows scan results in the top bar: "Scanned: . Scan completed X folders, found Y folders"
-        * Shows folder size and full path instead of just folder name
-        * Directory sizes displayed in human-readable format (B, KB, MB, GB)
-        * Instructions are displayed properly in the bottom bar
+1.  **Status Bar (Top)**:
+    *   Displays the current operation: `Scanning`, `Stopping`, `Scanned`, or `Deletion Complete`.
+    *   During a scan, it shows an animated spinner and the path of the directory currently being examined.
+    *   After a scan, it provides a summary of the total folders found.
 
-        * ESC or 'n': Cancel confirmation dialog
-        * Enter: Confirm deletion (not toggle selection)
----
+2.  **Configuration Panel (Left)**:
+    *   This panel is split vertically.
+    *   **Folders to Clean**: A static list of folder names the application is configured to search for (e.g., `node_modules`, `target`).
+    *   **Ignore Patterns**: A list of glob patterns for directories to ignore during the scan (e.g., `.*` to ignore hidden directories).
 
-### **Technical & Implementation Requirements**
+3.  **Results Panel (Right)**:
+    *   Displays the list of found directories **in real-time** as the scan progresses.
+    *   Each entry shows its selection status (`[x]` or `[ ]`), human-readable size, and full path.
+    *   The list is automatically sorted with the **oldest folders appearing first**.
+    *   The title dynamically updates to show the total size of all currently selected folders.
 
-* **Language & Crates**:
-    * Use **Rust**.
-    * Use **`ratatui`** for the TUI, with the **`crossterm`** backend.
-    * Use the **`trash`** crate to safely move items to the system trash.
-    * Use a crate like **`clap`** for parsing command-line arguments.
-    * Use a crate like **`chrono`** or `std::time` for date/time calculations.
-* **Global Controls**:
-    * The user must be able to exit the application at any time by pressing `q` or `Esc`.
-* **Error Handling**:
-    * The application must not panic. Gracefully handle errors like file permission issues or invalid paths and display a message to the user in the TUI.
+4.  **Instructions Bar (Bottom)**:
+    *   Provides a quick reference for all available keyboard shortcuts.
+
+### Asynchronous Scanning & Selection
+
+*   **Asynchronous Scan**: The directory scan runs on a background thread, so the UI remains responsive at all times.
+*   **Recursive Search**: The scan starts from the current directory or a path provided as a command-line argument (e.g., `disk-cleaner ./my-projects`).
+*   **Automatic Selection**: Folders that were last modified **more than 30 days ago** are automatically selected for deletion by default.
 
 ---
 
-### **Testing Requirements**
+## Controls
 
-* Write unit tests for the **business logic**, not the UI rendering.
-* **Test Scope**:
-    * The logic for parsing command-line arguments.
-    * The recursive directory scanning function.
-    * The filtering logic that correctly identifies folders older than 30 days.
-* **Methodology**: Tests should create temporary directories and files to simulate a real file system, ensuring tests are hermetic and don't affect the user's actual files.
+*   `↑`/`↓` **Arrow Keys**: Navigate the list of found directories.
+*   **Spacebar**: Manually select or deselect the highlighted directory.
+*   `a` / `d`: Select / Deselect all directories in the list.
+*   `c` or `Enter`: Proceed to confirm the deletion of selected items.
+*   `Esc`:
+    *   During a scan, it opens a confirmation dialog to stop the process.
+    *   At any other time, it will quit the application.
+*   `q`: Quit the application at any time.
 
 ---
+
+## Dialogs
+
+The application uses contextual pop-up dialogs for important actions:
+
+1.  **Stop Scan Confirmation**:
+    *   Triggered by `Esc` during a scan.
+    *   Asks: `Stop the current scan? (Y/n)`
+    *   `Y`: Stops the scan immediately and displays all results found up to that point.
+    *   `N`: Closes the dialog and resumes the scan.
+
+2.  **Deletion Confirmation**:
+    *   Triggered by `c` or `Enter` when items are selected.
+    *   Asks: `Move X selected items to trash? (Y/n)`
+    *   `Y`: Moves the selected folders to the system's trash bin.
+    *   `N`: Cancels the operation and returns to the list view.
+
+3.  **Deletion Summary**:
+    *   Appears after a successful deletion.
+    *   Summarizes the number of folders cleaned and the total space freed.
+    *   Prompts the user to press `y` or `enter` to exit the application.
+
+---
+
+## Technical & Implementation Details
+
+*   **Language**: **Rust**
+*   **Crates**:
+    *   **`ratatui`** with the **`crossterm`** backend for the TUI.
+    *   **`trash`** for safely moving items to the system trash.
+    *   **`walkdir`** for recursive directory traversal.
+    *   **`glob`** for matching ignore patterns.
+*   **Architecture**:
+    *   The application is built with a modular structure, separating logic into `main.rs` (entry point), `app.rs` (state management), `ui.rs` (rendering), and `scanner.rs` (file system logic).
+*   **Error Handling**:
+    *   The application is designed to handle errors gracefully (e.g., permission issues) without crashing.
+
+---
+
+## Testing Requirements
+
+*   Unit tests should cover the business logic, not UI rendering.
+*   **Test Scope**:
+    *   Logic for parsing command-line arguments.
+    *   Recursive directory scanning function.
+    *   Filtering logic that correctly identifies folders older than 30 days.
+*   **Methodology**: Tests should create temporary directories and files to simulate a real file system, ensuring tests are hermetic and don't affect the user's actual files.
