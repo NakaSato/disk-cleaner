@@ -98,3 +98,20 @@ The application uses contextual pop-up dialogs for important actions:
     *   Recursive directory scanning function.
     *   Filtering logic that correctly identifies folders older than 30 days.
 *   **Methodology**: Tests should create temporary directories and files to simulate a real file system, ensuring tests are hermetic and don't affect the user's actual files.
+
+---
+
+## Future Improvements
+
+Here are some potential features and enhancements for the future:
+
+*   **Configuration File (`cleaner.toml`)**:
+    *   Load "folders to clean" and "ignore patterns" from a user-defined configuration file instead of having them hardcoded.
+*   **Interactive Configuration**:
+    *   Allow users to toggle which folders to scan and to add/remove ignore patterns directly within the UI.
+*   **Error and Logging Panel**:
+    *   Add a dedicated panel or log file to display errors, such as when a folder cannot be deleted due to permission issues.
+*   **More Granular Time-Based Filtering**:
+    *   Allow users to specify a custom time frame for automatic selection (e.g., "older than 7 days," "older than 6 months") via a command-line argument or UI setting.
+*   **Performance Optimizations for Size Calculation**:
+    *   Use parallel processing or lazy calculation to speed up the directory size calculation, which can be slow for large folders like `node_modules`.
