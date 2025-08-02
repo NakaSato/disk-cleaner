@@ -179,10 +179,8 @@ impl App {
         for dir in &self.dirs_to_clean {
             if dir.selected {
                 // Try to move the directory to trash
-                match trash::delete(&dir.path) {
-                    Ok(()) => println!("Moved to trash: {}", dir.path.display()),
-                    Err(e) => eprintln!("Failed to move to trash {}: {}", dir.path.display(), e),
-                }
+                // Errors are ignored for now. A rescan will update the list state.
+                let _ = trash::delete(&dir.path);
             }
         }
     }
