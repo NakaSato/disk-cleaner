@@ -31,7 +31,9 @@ const SPINNER_CHARS: [char; 8] = ['⠁', '⠂', '⠄', '⡀', '⢀', '⠠', '⠐
 // App state enum
 enum AppState {
     Scanning,
+    Stopping,
     ScanComplete,
+    DeletionComplete,
 }
 
 // Messages from scan thread
@@ -56,6 +58,7 @@ struct ScanResults {
     total_folders: usize,
     found_folders: usize,
     total_size_gb: f64,
+    selected_size_gb: f64,
 }
 
 // App state
@@ -65,6 +68,7 @@ struct App {
     current_scan_path: Option<PathBuf>,
     scan_receiver: Option<mpsc::Receiver<ScanUpdate>>,
     scan_stop_signal: Arc<AtomicBool>,
+    deletion_summary: Option<(usize, u64)>,
     folders_to_clean: Vec<String>,
     selected_folders: Vec<bool>,
     ignore_patterns: Vec<String>,
@@ -83,6 +87,7 @@ impl App {
             current_scan_path: None,
             scan_receiver: None,
             scan_stop_signal: Arc::new(AtomicBool::new(false)),
+            deletion_summary: None,
             folders_to_clean: vec!["node_modules".to_string(), "target".to_string()],
             selected_folders: vec![true, true],
             ignore_patterns: vec![".*".to_string()],
@@ -174,30 +179,50 @@ impl App {
         });
     }
 
-    fn move_dirs_to_trash(&self) {
-        // Move selected directories to trash
+    fn move_dirs_to_trash(&self) -> (usize, u64) {
+        let mut deleted_count = 0;
+        let mut deleted_size = 0;
+
         for dir in &self.dirs_to_clean {
-            if dir.selected {
-                // Try to move the directory to trash
-                // Errors are ignored for now. A rescan will update the list state.
-                let _ = trash::delete(&dir.path);
+            if dir.selected && trash::delete(&dir.path).is_ok() {
+                deleted_count += 1;
+                deleted_size += dir.size_bytes;
             }
         }
+        (deleted_count, deleted_size)
     }
 
     fn update_selection_scan_results(&mut self) {
-        self.scan_results.found_folders = self.dirs_to_clean.iter().filter(|d| d.selected).count();
+        let (count, size) = self
+            .dirs_to_clean
+            .iter()
+            .filter(|d| d.selected)
+            .fold((0, 0), |(count, size), dir| {
+                (count + 1, size + dir.size_bytes)
+            });
+        self.scan_results.found_folders = count;
+        self.scan_results.selected_size_gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) {
+        if let AppState::DeletionComplete = self.state {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => std::process::exit(0),
+                _ => {}
+            }
+            return;
+        }
+
         if let Some(ref action) = self.confirm_action.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if action.starts_with("Move") {
-                        self.move_dirs_to_trash();
-                        self.start_scan();
+                        let (count, size) = self.move_dirs_to_trash();
+                        self.deletion_summary = Some((count, size));
+                        self.state = AppState::DeletionComplete;
                     } else if action == "Stop the current scan" {
                         self.scan_stop_signal.store(true, Ordering::SeqCst);
+                        self.state = AppState::Stopping;
                     }
                     self.confirm_action = None;
                 }
@@ -217,7 +242,10 @@ impl App {
                 }
                 _ => {}
             },
-            AppState::ScanComplete => match key.code {
+            AppState::Stopping => {
+                // Ignore key events while stopping
+            }
+            AppState::ScanComplete | AppState::DeletionComplete => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => std::process::exit(0),
                 // Handle list navigation with clamped indices
                 KeyCode::Down => {
@@ -353,8 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.dirs_to_clean.sort_by_key(|d| d.modified_days_ago);
 
                         app.scan_results.total_folders = app.dirs_to_clean.len();
-                        app.scan_results.found_folders =
-                            app.dirs_to_clean.iter().filter(|d| d.selected).count();
+                        app.update_selection_scan_results();
                         app.scan_results.total_size_gb = app
                             .dirs_to_clean
                             .iter()
@@ -416,7 +443,10 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     // Top bar with directory info and scan results
     let dir_info = match app.state {
         AppState::Scanning => format!("Scanning: {}", app.current_directory.display()),
-        AppState::ScanComplete => format!("Scanned: {}", app.current_directory.display()),
+        AppState::Stopping => format!("Stopping: {}", app.current_directory.display()),
+        AppState::ScanComplete | AppState::DeletionComplete => {
+            format!("Scanned: {}", app.current_directory.display())
+        }
     };
     let scan_results_text = match app.state {
         AppState::Scanning => {
@@ -428,7 +458,8 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
                 .unwrap_or_default();
             format!("{} {}", spinner, path_str)
         }
-        AppState::ScanComplete => format!(
+        AppState::Stopping => "Please wait...".to_string(),
+        AppState::ScanComplete | AppState::DeletionComplete => format!(
             "Scan completed {} folders, found {} folders",
             app.scan_results.total_folders, app.scan_results.found_folders
         ),
@@ -519,12 +550,16 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     }
 
     // Create list widget for directories
-    let dirs_list = List::new(file_items)
-        .block(
-            Block::default()
-                .title("Directories to clean")
-                .borders(Borders::ALL),
+    let title = if app.scan_results.selected_size_gb > 0.0 {
+        format!(
+            "Directories to clean: {:.2} GB selected",
+            app.scan_results.selected_size_gb
         )
+    } else {
+        "Directories to clean".to_string()
+    };
+    let dirs_list = List::new(file_items)
+        .block(Block::default().title(title).borders(Borders::ALL))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     f.render_stateful_widget(dirs_list, content_chunks[1], &mut app.dir_list_state);
@@ -566,5 +601,39 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
         f.render_widget(ratatui::widgets::Clear, confirm_area); // Clear the area before drawing
         f.render_widget(confirm_paragraph, confirm_area);
+    }
+
+    // Handle Deletion Summary
+    if let AppState::DeletionComplete = app.state {
+        if let Some((count, size)) = app.deletion_summary {
+            let size_gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
+            let summary_text = format!(
+                "Cleaned {} folders, freeing {:.2} GB.\n\nPress 'y' or 'enter' to exit.",
+                count, size_gb
+            );
+            let summary_block = Block::default()
+                .title("Deletion Complete")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green));
+            let summary_paragraph = Paragraph::new(summary_text)
+                .block(summary_block)
+                .style(Style::default().bg(Color::DarkGray))
+                .alignment(ratatui::layout::Alignment::Center);
+
+            let area_width = area.width;
+            let area_height = area.height;
+            let popup_width = 50;
+            let popup_height = 7;
+
+            let summary_area = Rect {
+                x: area.x + (area_width.saturating_sub(popup_width)) / 2,
+                y: area.y + (area_height.saturating_sub(popup_height)) / 2,
+                width: popup_width,
+                height: popup_height,
+            };
+
+            f.render_widget(ratatui::widgets::Clear, summary_area);
+            f.render_widget(summary_paragraph, summary_area);
+        }
     }
 }
