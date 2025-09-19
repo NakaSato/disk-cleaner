@@ -64,6 +64,7 @@ pub struct App {
     pub dir_list_state: ListState,
     pub confirm_action: Option<String>,
     pub scan_results: ScanResults,
+    pub should_exit: bool,
 }
 
 impl App {
@@ -83,6 +84,7 @@ impl App {
             dir_list_state: ListState::default(),
             confirm_action: None,
             scan_results: ScanResults::default(),
+            should_exit: false,
         }
     }
 
@@ -194,7 +196,7 @@ impl App {
     pub fn handle_key_event(&mut self, key: KeyEvent) {
         if let AppState::DeletionComplete = self.state {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => std::process::exit(0),
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.should_exit = true,
                 _ => {}
             }
             return;
@@ -223,7 +225,7 @@ impl App {
 
         match self.state {
             AppState::Scanning => match key.code {
-                KeyCode::Char('q') => std::process::exit(0),
+                KeyCode::Char('q') => self.should_exit = true,
                 KeyCode::Esc => {
                     self.confirm_action = Some("Stop the current scan".to_string());
                 }
@@ -233,7 +235,7 @@ impl App {
                 // Ignore key events while stopping
             }
             AppState::ScanComplete | AppState::DeletionComplete => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => std::process::exit(0),
+                KeyCode::Char('q') | KeyCode::Esc => self.should_exit = true,
                 // Handle list navigation with clamped indices
                 KeyCode::Down => {
                     // Handle list navigation down with proper bounds checking

@@ -37,6 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| ui::draw(f, &mut app))?;
 
+        // Check if we should exit
+        if app.should_exit {
+            break;
+        }
+
         // Handle scan updates
         if let Some(receiver) = &app.scan_receiver {
             if let Ok(update) = receiver.try_recv() {
